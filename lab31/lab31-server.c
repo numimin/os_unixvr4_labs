@@ -108,6 +108,15 @@ void interrupt(int unused) {
 
 static struct server server;
 
+void cleanup_if_eintr(struct server* this) {
+    if (errno == EINTR || quit_flag) {
+        printf("Interrupted. Exiting...\n");
+
+        cleanup_server(this);
+        exit(EXIT_SUCCESS);
+    }
+}
+
 void remove_client(struct server* this, size_t index) {
     if (index == 0) return;
 
@@ -163,7 +172,8 @@ void try_read(struct server* this, size_t readable_count) {
             ++read_fd;
             
             ssize_t count;
-            while ((count = read(this->clients[i].fd, this->buf, this->buf_size)) > 0) {
+            while (!quit_flag &&
+                (count = read(this->clients[i].fd, this->buf, this->buf_size)) > 0) {
                 for (size_t i = 0; i < count; ++i) {
                     if (islower(this->buf[i])) {
                         this->buf[i] = toupper(this->buf[i]);
@@ -173,6 +183,8 @@ void try_read(struct server* this, size_t readable_count) {
             }
 
             if (count == -1) {
+                cleanup_if_eintr(this);
+
                 if (errno != EAGAIN && errno != EWOULDBLOCK) {
                     perror("read");
                     remove_client(this, i);
@@ -222,10 +234,7 @@ int main() {
             const int client_fd = accept(get_sockfd(&server), NULL, NULL);
 
             if (client_fd == -1) {
-                if (errno == EINTR) {
-                    cleanup_server(&server);
-                    return EXIT_SUCCESS;
-                }
+                cleanup_if_eintr(&server);
 
                 perror("accept");
                 return EXIT_FAILURE;
@@ -240,10 +249,7 @@ int main() {
         try_read(&server, has_pending ? fd_count - 1 : fd_count);
     }
 
-    if (quit_flag) {
-        cleanup_server(&server);
-        return EXIT_SUCCESS;
-    }
+    cleanup_if_eintr(&server);
 
     perror("poll");
     cleanup_server(&server);
