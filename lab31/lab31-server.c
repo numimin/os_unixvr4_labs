@@ -213,12 +213,9 @@ int main() {
     }
 
     size_t fd_count;
-    while ((fd_count = poll(server.clients, server.client_count, -1)) != -1) {
-        if (quit_flag) {
-            cleanup_server(&server);
-            return EXIT_SUCCESS;
-        }
-
+    while (!quit_flag && 
+        (fd_count = poll(server.clients, server.client_count, -1)) != -1) {
+            
         const int has_pending = server.clients[0].revents & POLLIN;
 
         if (has_pending) {
