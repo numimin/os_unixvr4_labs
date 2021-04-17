@@ -38,7 +38,7 @@ int main(int argc, char* argv[]) {
     }
     const char* filename = argv[1];
 
-    const char* cmd = strcat(
+    char* cmd = strcat(
         strcpy(
             malloc(sizeof("cat ") + strlen(filename)), 
             "cat "
@@ -46,9 +46,10 @@ int main(int argc, char* argv[]) {
         filename
     );
     FILE* pout = popen(cmd, "r");
+    free(cmd);
 
     if (pout == NULL) {
-        fprintf(stderr, "Couldn't open pipe\n");
+        perror("popen");
         return EXIT_FAILURE;
     }
 

@@ -4,6 +4,7 @@
 #include <stdlib.h>
 #include <signal.h>
 #include <stdio.h>
+#include <string.h>
 
 static int quit_flag = 0;
 static sig_atomic_t beep_count = 0;
@@ -19,6 +20,7 @@ void beep(int signum) {
 
 int main() {
     struct sigaction act;
+    memset(&act, 0, sizeof(act));
     act.sa_handler = beep,
     sigaction(SIGINT, &act, NULL);
 

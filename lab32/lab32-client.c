@@ -10,28 +10,16 @@
 
 void write_file(int fd, const char* filename) {
     const int file = open(filename, O_RDONLY);
-    if (file == -1) {
-        perror("open");
-        return;
-    }
 
-    const size_t pipe_size = 4096;
+    const size_t pipe_size = BUFSIZ;
     char* buf = malloc(pipe_size);
 
     size_t count;
     while ((count = read(file, buf, pipe_size))) {
-        if (count == -1) {
-            perror("read");
-            free(buf);
-            close(file);
-            return;
-        }
-
         write(fd, buf, count);
     }
 
     free(buf);
-    close(file);
 }
 
 int main(int argc, char* argv[]) {

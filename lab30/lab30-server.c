@@ -1,3 +1,5 @@
+#define _GNU_SOURCE
+
 #include <sys/socket.h>
 #include <sys/un.h>
 #include <stdlib.h>
@@ -7,6 +9,7 @@
 #include <unistd.h>
 #include <ctype.h>
 #include <errno.h>
+#include <signal.h>
 
 #include "addresses.h"
 
@@ -37,12 +40,27 @@ void cleanup(int sockfd) {
     close(sockfd);
 
     if (unlink(SERVER_ADDR)) {
-        perror("unlink");
+        if (errno != ENOENT) {
+            perror("unlink");
+        }
     }
 }
 
+
+static int sockfd;
+
+void interrupt(int unused) {
+    write(STDERR_FILENO, "\nInterrupted. Exiting...\n", sizeof("Interrupted. Exiting...\n"));
+    cleanup(sockfd);
+    _exit(EXIT_SUCCESS);
+}
+
 int main() {
-    const int sockfd = socket(AF_UNIX, SOCK_STREAM, 0);
+    struct sigaction act = {};
+    act.sa_handler = interrupt;
+    sigaction(SIGINT, &act, NULL);
+
+    sockfd = socket(AF_UNIX, SOCK_STREAM, 0);
     if (sockfd == -1) {
         perror("socket");
         return EXIT_FAILURE;
@@ -56,7 +74,7 @@ int main() {
 
     strncpy(addr.sun_path, SERVER_ADDR, sizeof(addr.sun_path));
 
-    if (bind(sockfd, cast_addr, sizeof(addr))){
+    if (bind(sockfd, cast_addr, sizeof(addr))) {
         perror("bind");
         cleanup(sockfd);
         return EXIT_FAILURE;

@@ -1,7 +1,7 @@
 #define _GNU_SOURCE
 
 #include <sys/socket.h>
-#include <sys/un.h>
+#include <netinet/in.h>
 #include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
@@ -12,14 +12,12 @@
 #include <signal.h>
 #include <poll.h>
 
-#include "addresses.h"
-
 #define REMOVED_CLIENT (-1)
 
-struct server {
-    char* address_path;
+#define MAX_SOCKETS 1024
 
-    struct pollfd clients[SOMAXCONN];
+struct server {
+    struct pollfd clients[MAX_SOCKETS];
     size_t client_count;
 
     char* buf;
@@ -29,12 +27,8 @@ struct server {
     size_t first_client_to_remove;
 };
 
-void cleanup(int sockfd, const char* path) {
+void cleanup(int sockfd) {
     close(sockfd);
-
-    if (unlink(path)) {
-        perror("unlink");
-    }
 }
 
 int get_sockfd(struct server* this) {
@@ -42,7 +36,7 @@ int get_sockfd(struct server* this) {
 }
 
 void safe_cleanup(struct server* this) {
-    cleanup(get_sockfd(this), this->address_path);
+    cleanup(get_sockfd(this));
     for (int i = 1; i < this->client_count; ++i) {
         close(this->clients[i].fd);
     }
@@ -50,48 +44,45 @@ void safe_cleanup(struct server* this) {
 
 #define ERR_SOCKET (-1)
 
-int server_setup(const char* socket_path) {
-    const int sockfd = socket(AF_UNIX, SOCK_STREAM, 0);
+int server_setup(in_port_t port) {
+    const int sockfd = socket(AF_INET, SOCK_STREAM, 0);
     if (sockfd == -1) {
         perror("socket");
         return ERR_SOCKET;
     }
 
-    struct sockaddr_un addr;
+    struct sockaddr_in addr;
     struct sockaddr* addrp = (struct sockaddr*) &addr;
 
     memset(&addr, 0, sizeof(addr));
-    addr.sun_family = AF_UNIX;
-
-    strncpy(addr.sun_path, socket_path, sizeof(addr.sun_path));
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    addr.sin_port = htons(port);
 
     if (bind(sockfd, addrp, sizeof(addr))){
         perror("bind");
-        cleanup(sockfd, socket_path);
+        cleanup(sockfd);
         return ERR_SOCKET;
     }
 
-    if (listen(sockfd, SOMAXCONN)) {
+    if (listen(sockfd, MAX_SOCKETS)) {
         perror("listen");
-        cleanup(sockfd, socket_path);
+        cleanup(sockfd);
         return ERR_SOCKET;
     }
 
     return sockfd;
 }
 
-int init_server(struct server* this, const char* socket_path) {
+int init_server(struct server* this, in_port_t port) {
     memset(this, 0, sizeof(*this));
 
-    const int sockfd = server_setup(socket_path);
+    const int sockfd = server_setup(port);
     if (sockfd == ERR_SOCKET) {
         return EXIT_FAILURE;
     }
 
-    this->address_path = malloc(strlen(socket_path) + 1);
-    strcpy(this->address_path, socket_path);
-
-    for (size_t i = 0; i < SOMAXCONN; ++i) {
+    for (size_t i = 0; i < MAX_SOCKETS; ++i) {
         this->clients[i].events = POLLIN;
     }
 
@@ -103,9 +94,9 @@ int init_server(struct server* this, const char* socket_path) {
 }
 
 void cleanup_server(struct server* this) {
-    cleanup(get_sockfd(this), this->address_path);
+    cleanup(get_sockfd(this));
     free(this->buf);
-    free(this->address_path);
+    this->buf = NULL;
 }
 
 static struct server server;
@@ -171,37 +162,52 @@ void try_read(struct server* this, size_t readable_count) {
             ++read_fd;
             
             const ssize_t count = read(this->clients[i].fd, this->buf, this->buf_size);
+
+            if (count == -1) {
+                perror("read");
+                remove_client(this, i);
+                continue;
+            }
+
+            if (count == 0) {
+                remove_client(this, i);
+                continue;
+            }
+
             for (size_t i = 0; i < count; ++i) {
                 if (islower(this->buf[i])) {
                     this->buf[i] = toupper(this->buf[i]);
                 }
             }
             write(STDOUT_FILENO, this->buf, count);
-
-            if (count == -1) {
-                perror("read");
-                remove_client(this, i);
-            }
-
-            if (count == 0) {
-                remove_client(this, i);
-            }
         }
     }
     commit_remove_clients(this);
 }
 
-int mx_add(struct server* this, int client_fd) {
+void mx_add(struct server* this, int client_fd) {
+    fprintf(stderr, "Server: added %d\n", this->client_count);
     this->clients[this->client_count++].fd = client_fd;
-    return EXIT_SUCCESS;
 }
 
-int main() {
+int main(int argc, char* argv[]) {
+    if (argc != 2) {
+        fprintf(stderr, "Usage: %s PORT", argv[0]);
+        return EXIT_FAILURE;
+    }
+
     struct sigaction act = {};
     act.sa_handler = interrupt;
     sigaction(SIGINT, &act, NULL);
 
-    if (init_server(&server, SERVER_ADDR) != EXIT_SUCCESS) {
+    char* end;
+    const in_port_t port = strtol(argv[1], &end, 10);
+    if (*end != '\0' || port < 0) {
+        fprintf(stderr, "PORT must be a positive integer\n");
+        return EXIT_FAILURE;
+    }
+
+    if (init_server(&server, port) != EXIT_SUCCESS) {
         return EXIT_FAILURE;
     }
 
@@ -215,14 +221,10 @@ int main() {
 
             if (client_fd == -1) {
                 perror("accept");
-                cleanup_server(&server);
-                return EXIT_FAILURE;
+                continue;
             }
 
-            if (mx_add(&server, client_fd) != EXIT_SUCCESS) {
-                cleanup_server(&server);
-                return EXIT_FAILURE;
-            }
+            mx_add(&server, client_fd);
         }
 
         try_read(&server, has_pending ? fd_count - 1 : fd_count);

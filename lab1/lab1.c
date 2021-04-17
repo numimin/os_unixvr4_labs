@@ -135,7 +135,7 @@ void execute_option(option opt) {
         case 'd': {
             char* cwd = get_current_dir_name();
             printf("Working directory: %s\n", cwd);
-            free(cwd);
+            free(cwd);  
             break;
         }
 

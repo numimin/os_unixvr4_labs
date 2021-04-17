@@ -41,6 +41,9 @@ int write_file(struct data* data) {
     while ((count = read(file, buf, pipe_size))) {
         if (count == -1) {
             perror("read");
+            free(buf);
+            close(data->pin_fd);
+            close(file);
             return EXIT_FAILURE;
         }
 
@@ -49,6 +52,7 @@ int write_file(struct data* data) {
 
     free(buf);
     close(data->pin_fd);
+    close(file);
 
     return EXIT_SUCCESS;
 }
@@ -63,6 +67,8 @@ int print_upper(struct data* data) {
     while ((count = read(data->pout_fd, buf, pipe_size))) {
         if (count == -1) {
             perror("read");
+            free(buf);
+            close(data->pout_fd);
             return EXIT_FAILURE;
         }
 
