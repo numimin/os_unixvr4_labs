@@ -9,13 +9,13 @@
 #include "addresses.h"
 
 void write_file(int fd, const char* filename) {
-    const int file = open(filename, O_RDONLY);
+    //const int file = open(filename, O_RDONLY);
 
     const size_t pipe_size = BUFSIZ;
     char* buf = malloc(pipe_size);
 
     size_t count;
-    while ((count = read(file, buf, pipe_size))) {
+    while ((count = read(STDIN_FILENO, buf, pipe_size))) {
         write(fd, buf, count);
     }
 

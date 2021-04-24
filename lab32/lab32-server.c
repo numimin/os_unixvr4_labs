@@ -99,7 +99,7 @@ void add_client(struct server* this, int fd) {
 
     if (index >= this->client_count) {
         this->clients[index].aio_buf = malloc(this->buf_size);
-        ++this->client_count;
+        this->client_count++;
     }
     this->clients[index].aio_fildes = fd;
 
@@ -167,36 +167,36 @@ void remove_client(struct server* this, size_t index) {
 #define DEBUG(S) write(STDERR_FILENO, (S), sizeof(S))
 
 void aio_handler(int signum, siginfo_t *siginfo, void* vunused) {
-    const size_t index = siginfo->si_value.sival_int;
+    for (size_t i = 0; i < server.client_count; ++i) {
+        if (server.clients[i].aio_fildes == REMOVED_CLIENT) continue;
 
-    if (server.clients[index].aio_fildes == REMOVED_CLIENT) return;
-
-    const int err = aio_error(&server.clients[index]);
-    if (err == EINPROGRESS || err == ECANCELED) {
-        return;
-    }
-
-    if (err > 0) {
-        DEBUG("I/O Error\n");
-        safe_cleanup(&server);
-        _exit(EXIT_FAILURE);
-    }
-
-    const ssize_t count = aio_return(&server.clients[index]);
-
-    if (count == 0) {
-        remove_client(&server, index);
-        return;
-    }
-
-    char* buf = (char*) server.clients[index].aio_buf;
-    for (size_t i = 0; i < count; ++i) {
-        if (islower(buf[i])) {
-            buf[i] = toupper(buf[i]);
+        const int err = aio_error(&server.clients[i]);
+        if (err == EINPROGRESS || err == ECANCELED) {
+            continue;
         }
+
+        if (err > 0) {
+            DEBUG("I/O Error\n");
+            safe_cleanup(&server);
+            _exit(EXIT_FAILURE);
+        }
+
+        const ssize_t count = aio_return(&server.clients[i]);
+
+        if (count == 0) {
+            remove_client(&server, i);
+            continue;
+        }
+
+        char* buf = (char*) server.clients[i].aio_buf;
+        for (size_t i = 0; i < count; ++i) {
+            if (islower(buf[i])) {
+                buf[i] = toupper(buf[i]);
+            }
+        }
+        write(STDOUT_FILENO, buf, count);
+        aio_read(&server.clients[i]);
     }
-    write(STDOUT_FILENO, buf, count);
-    aio_read(&server.clients[index]);
 }
 
 int main() {
@@ -215,7 +215,6 @@ int main() {
 
     for (;;) {
         const int client_fd = accept(server.sockfd, NULL, NULL);
-        fprintf(stderr, "h0");
         if (client_fd == -1) {
             if (errno == EINTR) {
                 continue;

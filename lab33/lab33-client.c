@@ -10,8 +10,8 @@
 #include <arpa/inet.h>
 
 int main(int argc, char* argv[]) {
-    if (argc != 2) {
-        fprintf(stderr, "Usage: %s PORT\n", argv[0]);
+    if (argc != 3) {
+        fprintf(stderr, "Usage: %s PORT INDEX\n", argv[0]);
         return EXIT_FAILURE;
     }
 
@@ -19,6 +19,12 @@ int main(int argc, char* argv[]) {
     const in_port_t port = strtol(argv[1], &end, 10);
     if (*end != '\0' || port < 0) {
         fprintf(stderr, "PORT must be a positive integer\n");
+        return EXIT_FAILURE;
+    }
+
+    const long index = strtol(argv[2], &end, 10);
+    if (*end != '\0' || port < 0) {
+        fprintf(stderr, "INDEX must be a positive integer\n");
         return EXIT_FAILURE;
     }
 
@@ -42,22 +48,18 @@ int main(int argc, char* argv[]) {
         return EXIT_FAILURE;
     }
 
-    char buf[BUFSIZ];
-    const char* line = "echo\n";
+    char line[64];
+    sprintf(line, "echo %d\n", index);
     while (1) {
-        ssize_t count = write(sockfd, line, strlen(line));
+        for (size_t i = 0; i < 1000; ++i) {
+            ssize_t count = write(sockfd, line, strlen(line));
+            if (count <= 0) {
+                perror("write");
+                break;
+            }
+            sleep(3);
+        }
         printf("write\n");
-        if (count <= 0) {
-            perror("write");
-            break;
-        }
-        sleep(1);
-        /*count = read(sockfd, buf, BUFSIZ);
-        if (count <= 0) {
-            perror("read");
-            break;
-        }
-        write(STDOUT_FILENO, buf, count);*/
     }
 
     close(sockfd);

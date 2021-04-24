@@ -6,11 +6,21 @@
 #include <stdio.h>
 #include <string.h>
 
-static int quit_flag = 0;
 static sig_atomic_t beep_count = 0;
 
+#define WRITE(S) {write(STDOUT_FILENO, (S), sizeof(S));}
+
+static sigset_t sigint_mask;
+
 void quit_handler(int signum) {
-    quit_flag = 1;
+    sigprocmask(SIG_BLOCK, &sigint_mask, NULL);
+
+    WRITE("I've beeped ");
+    char buf[64];
+    sprintf(buf, "%d", beep_count);
+    write(STDOUT_FILENO, buf, strlen(buf));
+    WRITE(" times\n");
+    _exit(EXIT_SUCCESS);
 }
 
 void beep(int signum) {
@@ -19,8 +29,10 @@ void beep(int signum) {
 }
 
 int main() {
-    struct sigaction act;
-    memset(&act, 0, sizeof(act));
+    sigemptyset(&sigint_mask);
+    sigaddset(&sigint_mask, SIGINT);
+
+    struct sigaction act = {};
     act.sa_handler = beep,
     sigaction(SIGINT, &act, NULL);
 
@@ -29,10 +41,6 @@ int main() {
 
     for (;;) {
         pause();
-        if (quit_flag) {
-            printf("I've beeped %d times\n", beep_count);
-            break;
-        }
     }
     return EXIT_SUCCESS;
 }

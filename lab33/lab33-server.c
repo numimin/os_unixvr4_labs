@@ -2,6 +2,7 @@
 
 #include <sys/socket.h>
 #include <netinet/in.h>
+#include <netdb.h>
 #include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
@@ -11,188 +12,187 @@
 #include <errno.h>
 #include <signal.h>
 #include <poll.h>
+#include <arpa/inet.h>
+#include <netinet/tcp.h>
 
-#define REMOVED_CLIENT (-1)
+#include "usual_server_management.h"
+#include "utils.h"
 
-#define MAX_SOCKETS 1024
-
-struct server {
-    struct pollfd clients[MAX_SOCKETS];
+typedef struct {
+    Server server;
+    int id_table[MAX_CLIENTS];
     size_t client_count;
+    size_t removed_count;
+} ProxyServer;
 
-    char* buf;
-    size_t buf_size;
-
-    size_t clients_to_remove_count;
-    size_t first_client_to_remove;
-};
-
-void cleanup(int sockfd) {
-    close(sockfd);
-}
-
-int get_sockfd(struct server* this) {
-    return this->clients[0].fd;
-}
-
-void safe_cleanup(struct server* this) {
-    cleanup(get_sockfd(this));
-    for (int i = 1; i < this->client_count; ++i) {
-        close(this->clients[i].fd);
-    }
-}
-
-#define ERR_SOCKET (-1)
-
-int server_setup(in_port_t port) {
-    const int sockfd = socket(AF_INET, SOCK_STREAM, 0);
-    if (sockfd == -1) {
-        perror("socket");
-        return ERR_SOCKET;
-    }
-
-    struct sockaddr_in addr;
-    struct sockaddr* addrp = (struct sockaddr*) &addr;
-
-    memset(&addr, 0, sizeof(addr));
-    addr.sin_family = AF_INET;
-    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-    addr.sin_port = htons(port);
-
-    if (bind(sockfd, addrp, sizeof(addr))){
-        perror("bind");
-        cleanup(sockfd);
-        return ERR_SOCKET;
-    }
-
-    if (listen(sockfd, MAX_SOCKETS)) {
-        perror("listen");
-        cleanup(sockfd);
-        return ERR_SOCKET;
-    }
-
-    return sockfd;
-}
-
-int init_server(struct server* this, in_port_t port) {
-    memset(this, 0, sizeof(*this));
-
-    const int sockfd = server_setup(port);
-    if (sockfd == ERR_SOCKET) {
-        return EXIT_FAILURE;
-    }
-
-    for (size_t i = 0; i < MAX_SOCKETS; ++i) {
-        this->clients[i].events = POLLIN;
-    }
-
-    this->clients[this->client_count++].fd = sockfd;
-
-    this->buf_size = BUFSIZ;
-    this->buf = malloc(this->buf_size);
-    return EXIT_SUCCESS;
-}
-
-void cleanup_server(struct server* this) {
-    cleanup(get_sockfd(this));
-    free(this->buf);
-    this->buf = NULL;
-}
-
-static struct server server;
+static ProxyServer proxy_server;
 
 void interrupt(int unused) {
     write(STDERR_FILENO, "\nInterrupted. Exiting...\n", sizeof("Interrupted. Exiting...\n"));
-    safe_cleanup(&server);
+    safe_cleanup(&proxy_server.server);
     _exit(EXIT_SUCCESS);
 }
 
-void remove_client(struct server* this, size_t index) {
-    if (index == 0) return;
-
-    if (this->clients[index].fd == REMOVED_CLIENT) return;
-
-    close(this->clients[index].fd);
-    this->clients[index].fd = REMOVED_CLIENT;
-    this->clients_to_remove_count++;
-
-    if (this->first_client_to_remove == 0 || this->first_client_to_remove > index) {
-        this->first_client_to_remove = index;
-    }
+int can_read_from(struct pollfd* pollfd) {
+    return pollfd->revents & POLLIN;
 }
 
-void swap(int* a, int* b) {
-    int tmp = *a;
-    *a = *b;
-    *b = tmp;
+int can_write_to(struct pollfd* pollfd) {
+    return pollfd->revents & POLLOUT;
 }
 
-void commit_remove_clients(struct server* this) {
-    if (!this->clients_to_remove_count) return;
-    if (!this->first_client_to_remove) return;
+int has_errors(struct pollfd* pollfd) {
+    return pollfd->revents & POLLERR;
+}
 
-    size_t removed_count = 0;
+int is_ioable(struct pollfd* pollfd) {
+    return can_read_from(pollfd) || can_write_to(pollfd) || has_errors(pollfd);
+}
 
-    size_t j = this->client_count - 1;
+bool try_transfer(struct pollfd* sender, char* buffer, size_t buf_size) {
+    if (can_read_from(sender)) {
+        const ssize_t count = read(sender->fd, buffer, buf_size);
+        if (count < 0) {
+            perror("read");
+            return false;
+        }
 
-    for (size_t i = this->first_client_to_remove; 
-        removed_count < this->clients_to_remove_count && i < j; ++i) {
+        if (count == 0) {
+            return false;
+        }
 
-        if (this->clients[i].fd == REMOVED_CLIENT) {
-            while (this->clients[j].fd == REMOVED_CLIENT && j > i) {
-                --j;
-                ++removed_count;
+        for (size_t i = 0; i < count; ++i) {
+            if (islower(buffer[i])) {
+                buffer[i] = toupper(buffer[i]);
             }
-            swap(&this->clients[i].fd, &this->clients[j].fd);
-            --j;
-            ++removed_count;
+        }
+
+        write(STDOUT_FILENO, buffer, count);
+    }
+
+    return true;
+}
+
+void commit_remove(ProxyServer* proxy) {
+    size_t removed = 0;
+    size_t j = proxy->client_count - 1;
+
+    for (size_t i = 0; i < j && removed < proxy->removed_count; ++i) {
+        if (proxy->id_table[i] == REMOVED_CLIENT) {
+            while (proxy->id_table[j] == REMOVED_CLIENT && j > i) {
+                j--;
+                removed++;
+            }
+            swap_int(&proxy->id_table[i], &proxy->id_table[j]);
+            j--;
+            removed++;
         }
     }
-    
-    this->client_count -= this->clients_to_remove_count;
 
-    this->clients_to_remove_count = 0;
-    this->first_client_to_remove = 0;
+    proxy->client_count -= proxy->removed_count;
+    proxy->removed_count = 0;
 }
 
-void try_read(struct server* this, size_t readable_count) {
-    size_t read_fd = 0;
-    for (size_t i = 1; read_fd <= readable_count && i < this->client_count; ++i) {
-        if (this->clients[i].revents & POLLIN) {
-            ++read_fd;
-            
-            const ssize_t count = read(this->clients[i].fd, this->buf, this->buf_size);
+void pr_remove_client(ProxyServer* proxy, int i) {
+    if (proxy->id_table[i] == REMOVED_CLIENT) return;
 
-            if (count == -1) {
-                perror("read");
-                remove_client(this, i);
+    remove_client(&proxy->server, proxy->id_table[i]);
+    proxy->id_table[i] = REMOVED_CLIENT;
+    proxy->removed_count++;
+}
+
+void try_read(ProxyServer* proxy, size_t ioable_count) {
+    size_t ioable_processed = 0;
+
+    Server* this = &proxy->server;
+
+    for (size_t i = 0; ioable_processed < ioable_count && i < proxy->client_count; ++i) {
+        const int id = proxy->id_table[i];
+
+        struct pollfd* client = get_client(this, id);
+
+        if (is_ioable(client)) ioable_processed++;
+
+        if (has_errors(client)) {
+            pr_remove_client(proxy, i);
+            continue;
+        }
+
+        if (!try_transfer(client, this->buf, this->buf_size)) {
+            pr_remove_client(proxy, i);
+            continue;
+        }
+    }
+    commit_remove(proxy);
+}
+
+int main_loop(ProxyServer* proxy) {
+    Server* this = &proxy->server;
+
+    size_t fd_count;
+    while ((fd_count = poll(this->clients, get_poll_count(this), -1)) != -1) {
+        const int has_pending = get_listener(this)->revents & POLLIN;
+
+        if (has_pending) {
+            const int client_fd = accept(get_listener(this)->fd, NULL, NULL);
+
+            if (client_fd == -1) {
                 continue;
             }
 
-            if (count == 0) {
-                remove_client(this, i);
+            const int id = add_client(this, client_fd);
+            if (id == NO_ID) {
+                close(client_fd);
                 continue;
             }
 
-            for (size_t i = 0; i < count; ++i) {
-                if (islower(this->buf[i])) {
-                    this->buf[i] = toupper(this->buf[i]);
-                }
-            }
-            write(STDOUT_FILENO, this->buf, count);
+            proxy->id_table[proxy->client_count++] = id;
         }
+
+        try_read(proxy, has_pending ? fd_count - 1 : fd_count);
     }
-    commit_remove_clients(this);
+
+    perror("poll");
+    cleanup_server(this);
+    return EXIT_FAILURE;
 }
 
-void mx_add(struct server* this, int client_fd) {
-    fprintf(stderr, "Server: added %d\n", this->client_count);
-    this->clients[this->client_count++].fd = client_fd;
+int parse_parameters(ServerParams* this, int argc, char* argv[]) {
+    if (argc != 2) {
+        fprintf(stderr, "Usage: %s LISTENING_PORT\n", argv[0]);
+        return EXIT_FAILURE;
+    }
+
+    char* end;
+    const in_port_t listen_port = strtol(argv[1], &end, 10);
+    if (*end != '\0' || listen_port < 0) {
+        fprintf(stderr, "LISTENING_PORT must be a positive integer\n");
+        return EXIT_FAILURE;
+    }
+
+    struct sockaddr_in addr_in;
+    init_addr_in(&addr_in, htonl(INADDR_LOOPBACK), htons(listen_port), AF_INET);
+    memcpy(&this->listener_addr.address, &addr_in, sizeof(addr_in));
+    this->listener_addr.length = sizeof(addr_in);
+
+    return EXIT_SUCCESS;
+}
+
+int pr_init_server(ProxyServer* this, const ServerParams* params) {
+    memset(this, 0, sizeof(*this));
+
+    if (init_server(&this->server, params) == EXIT_FAILURE) return EXIT_FAILURE;
+
+    for (size_t i = 0; i < MAX_CLIENTS; ++i) {
+        this->id_table[i] = REMOVED_CLIENT;
+    }
+
+    return EXIT_SUCCESS;
 }
 
 int main(int argc, char* argv[]) {
-    if (argc != 2) {
-        fprintf(stderr, "Usage: %s PORT", argv[0]);
+    ServerParams params;
+    if (parse_parameters(&params, argc, argv) == EXIT_FAILURE) {
         return EXIT_FAILURE;
     }
 
@@ -200,37 +200,9 @@ int main(int argc, char* argv[]) {
     act.sa_handler = interrupt;
     sigaction(SIGINT, &act, NULL);
 
-    char* end;
-    const in_port_t port = strtol(argv[1], &end, 10);
-    if (*end != '\0' || port < 0) {
-        fprintf(stderr, "PORT must be a positive integer\n");
+    if (pr_init_server(&proxy_server, &params) != EXIT_SUCCESS) {
         return EXIT_FAILURE;
     }
 
-    if (init_server(&server, port) != EXIT_SUCCESS) {
-        return EXIT_FAILURE;
-    }
-
-    size_t fd_count;
-    while ((fd_count = poll(server.clients, server.client_count, -1)) != -1) {
-            
-        const int has_pending = server.clients[0].revents & POLLIN;
-
-        if (has_pending) {
-            const int client_fd = accept(get_sockfd(&server), NULL, NULL);
-
-            if (client_fd == -1) {
-                perror("accept");
-                continue;
-            }
-
-            mx_add(&server, client_fd);
-        }
-
-        try_read(&server, has_pending ? fd_count - 1 : fd_count);
-    }
-
-    perror("poll");
-    cleanup_server(&server);
-    return EXIT_SUCCESS;
+    return main_loop(&proxy_server);
 }
