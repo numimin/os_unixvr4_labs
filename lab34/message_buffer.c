@@ -2,8 +2,21 @@
 
 #include <string.h>
 
+#ifdef DEBUG
+
+#define MESSAGE_EDGE '^'
+#define MESSAGE_ESCAPE '?'
+
+#else 
+
 #define MESSAGE_EDGE 0x7E
 #define MESSAGE_ESCAPE 0b01111101
+
+#endif // DEBUG
+
+bool need_escape(char c) {
+    return c == MESSAGE_ESCAPE || c == MESSAGE_EDGE;
+}
 
 void free_messagebuf(MessageBuffer* this) {
     free_iobuf(&this->message);
@@ -16,6 +29,10 @@ void init_mb(MessageBuffer* this, size_t size) {
 
 bool mb_full(const MessageBuffer* this) {
     return iob_full(&this->message);
+}
+
+bool mb_empty(const MessageBuffer* this) {
+    return iob_empty(&this->message);
 }
 
 bool try_put(MessageBuffer* this, char c) {
@@ -42,28 +59,6 @@ bool put_start(MessageBuffer* this) {
     return true;
 }
 
-bool put_end(MessageBuffer* this) {
-    if (!this->started) return true;
-
-    if (!try_put(this, MESSAGE_EDGE)) return false;
-    this->started = false;
-    
-    return true;
-}
-
-bool put_order(MessageBuffer* this) {
-    if (this->order_put) return true;
-
-    if (!try_put(this, this->order)) return false;
-    this->order_put = true;
-
-    return true;
-}
-
-bool need_escape(char c) {
-    return c == MESSAGE_ESCAPE || c == MESSAGE_EDGE;
-}
-
 bool put_char(MessageBuffer* this, char c) {
     if (!put_escaped_char(this)) return false;
 
@@ -78,18 +73,34 @@ bool put_char(MessageBuffer* this, char c) {
     return true;
 }
 
+bool put_order(MessageBuffer* this) {
+    if (this->order_put) return true;
+    if (!put_escaped_char(this)) return false;
+
+    if (need_escape(this->order)) {
+        if (!try_put(this, MESSAGE_ESCAPE)) return false;
+        this->escape = true;
+        this->escaped_char = this->order;
+    } else {
+        if (!try_put(this, this->order)) return false;
+    }
+
+    this->order_put = true;
+    return true;
+}
+
 #include <stdio.h>
 
 ssize_t encapsulate(MessageBuffer* this, const char* data, size_t count, char order) {
-    if (this->started && this->order != order) {
+    if (this->start_put && this->order != order) {
+        if (!put_order(this)) return NO_SPACE;
         if (!put_escaped_char(this)) return NO_SPACE;
         if (!try_put(this, MESSAGE_EDGE)) return NO_SPACE;
+        this->start_put = false;
     }
 
-    if (!this->started || this->order != order) {
+    if (this->order != order) {
         this->order = order;
-        this->started == true;
-        this->start_put = false;
         this->order_put = false;
     }
 
@@ -103,20 +114,4 @@ ssize_t encapsulate(MessageBuffer* this, const char* data, size_t count, char or
     }
 
     return count;
-}
-
-int get_current_order(MessageBuffer* this) {
-
-}
-
-size_t get_contiguous_count(MessageBuffer* this) {
-
-}
-
-ssize_t decapsulate(MessageBuffer* this, char* data, size_t count) {
-
-}
-
-ssize_t skip(MessageBuffer* this, size_t count) {
-    
 }

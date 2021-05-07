@@ -81,6 +81,13 @@ bool iob_putc(IOBuffer* this, char c) {
     return true;
 }
 
+int iob_getc(IOBuffer* this) {
+    if (iob_empty(this)) return END_OF_BUFFER;
+    const char c = this->buf[0];
+    iob_shift(this, 1);
+    return c;
+}
+
 void iob_clear(IOBuffer* this) {
     this->count = 0;
 }

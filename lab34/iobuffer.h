@@ -5,6 +5,8 @@
 #include <unistd.h>
 #include <stdbool.h>
 
+#define END_OF_BUFFER (-1)
+
 typedef struct {
     char* buf;
     size_t size;
@@ -25,6 +27,8 @@ ssize_t iob_send(IOBuffer* this, int fd);
 size_t iob_puts(IOBuffer* this, const char* data, size_t count);
 bool iob_putc(IOBuffer* this, char c);
 void iob_clear(IOBuffer* this);
+
+int iob_getc(IOBuffer* this);
 
 void reserve(IOBuffer* this, size_t free_space);
 

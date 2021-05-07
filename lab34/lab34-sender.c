@@ -15,18 +15,16 @@
 #include <arpa/inet.h>
 #include <netinet/tcp.h>
 #include <stdbool.h>
+#include <time.h>
 
 #include "iobuffer.h"
+#include "cyclic_buffer.h"
 #include "socket_utils.h"
-#include "message_buffer.h"
 #include "server_management.h"
+#include "transport_protocol_buffer.h"
 
-#define CONTROL_ORDER 255
-
-#define CLIENT_ADD 1
-#define CLIENT_REMOVE 2
-
-#define EVENT_MESSAGE_LENGTH 2
+#define BUFFER_SIZE 1024
+#define MESSAGE_SIZE (2 * BUFFER_SIZE + 3)
 
 typedef struct {
     Server server;
@@ -37,45 +35,40 @@ typedef struct {
     bool remove_flag[MAX_CLIENTS];
     size_t client_count;
 
-    int add_queue[MAX_CLIENTS];
-    size_t event_start;
-    size_t event_end;
+    CyclicBuffer add_queue;
 
-    char event_message[EVENT_MESSAGE_LENGTH];
-    size_t written_count;
+    CyclicBuffer tunnel_buffers[MAX_CLIENTS];
+    TPBuffer tunnel_tpb;
+    CyclicBuffer client_buffers[MAX_CLIENTS];
 } TunnelServer;
-
-size_t mod_inc(size_t num, size_t mod) {
-    return (num + 1) % mod;
-}
 
 static TunnelServer tunnel_server;
 
 int init_tserver(TunnelServer* this, const TunnelParams* params) {
     memset(this, 0, sizeof(*this));
-    this->written_count = EVENT_MESSAGE_LENGTH;
 
     if (init_server(&this->server, params) == EXIT_FAILURE) return EXIT_FAILURE;
+
+    tpb_init(&this->tunnel_tpb, MESSAGE_SIZE);
+    cb_init(&this->add_queue, MAX_CLIENTS);
 
     return EXIT_SUCCESS;
 }
 
 void ts_remove_client(TunnelServer* this, int i) {
     const int id = this->id_table[i];
-    printf("remove client: %d\n", id);
-
     disconnect_client(&this->server, id);
     this->remove_flag[id] = true;
 }
 
 int ts_add_client(TunnelServer* this, int fd) {    
     const int id = add_client(&this->server, fd);
-    printf("add client: %d\n", id);
-
     if (id == NO_ID) return EXIT_FAILURE;
 
-    this->add_queue[this->event_end] = id;
-    this->event_end = mod_inc(this->event_end, MAX_CLIENTS);
+    cb_init(&this->client_buffers[id], BUFFER_SIZE);
+    cb_init(&this->tunnel_buffers[id], BUFFER_SIZE);
+
+    cb_putc(&this->add_queue, (char) id);
 
     this->id_table[this->client_count++] = id;
     return EXIT_SUCCESS;
@@ -87,56 +80,41 @@ void interrupt(int unused) {
     _exit(EXIT_SUCCESS);
 }
 
-int can_read(struct pollfd* pollfd) {
-    return pollfd->revents & POLLIN;
-}
-
-int can_write(struct pollfd* pollfd) {
-    return pollfd->revents & POLLOUT;
-}
-
-int has_errors(struct pollfd* pollfd) {
-    return pollfd->revents & POLLERR;
-}
-
 void perform_client_io(TunnelServer* this, size_t ioable_count) {
     Server* server = &this->server;
 
     size_t ioable_processed = 0;
-    struct pollfd* tunnel = get_tunnel(server);
-    if (can_read(tunnel) || can_write(tunnel)) {
+    if (tunnel_ioable(server)) {
         ioable_processed++;
     }
 
     for (size_t i = 0; ioable_processed < ioable_count && i < this->client_count; ++i) {
         const int id = this->id_table[i];
 
-        struct pollfd* client = get_client(server, id);
-
-        if (can_read(client) || can_write(client)) {
+        if (client_ioable(server, id)) {
             ++ioable_processed;
         }
 
-        if (has_errors(client)) {
+        if (client_has_errors(server, id)) {
             ts_remove_client(this, i);
             continue;
         }
 
-        if (!iob_full(get_client_buf(server, id)) && can_read(client)) {
-            const ssize_t count = iob_recv(get_client_buf(server, id), client->fd);
+        if (!cb_full(&this->client_buffers[id]) && client_readable(server, id)) {
+            const ssize_t count = cb_recv(&this->client_buffers[id], client_fd(server, id));
             if (count == -1) {
                 ts_remove_client(this, i);
                 continue;
             }
         }
 
-        if (!iob_empty(get_tunnel_buf(server, id)) && can_write(client)) {
-            const ssize_t sent = iob_send(get_tunnel_buf(server, id), client->fd);
+        /*if (!iob_empty(&this->tunnel_buffers[id]) && can_write(client)) {
+            const ssize_t sent = iob_send(&this->tunnel_buffers[id], client->fd);
             if (sent == -1) {
                 ts_remove_client(this, i);
                 continue;
             }
-        }
+        }*/
     }
 }
 
@@ -148,82 +126,66 @@ int next_message_client(TunnelServer* this, int previous) {
     const int start = (previous == NO_ORDER) ? 0 : (previous + 1) % this->client_count;
     const int end = (start >= 1) ? ((start - 1) % this->client_count) : (this->client_count - 1);
 
-    int client;
-    for (client = start; client != end; client = (client + 1) % this->client_count) {
-        if (!iob_empty(get_client_buf(server, this->id_table[client]))) break;
+    int i;
+    for (i = start; i != end; i = (i + 1) % this->client_count) {
+        if (!cb_empty(&this->client_buffers[this->id_table[i]])) break;
     }
 
-    if (client == end && iob_empty(get_client_buf(server, this->id_table[client]))) {
+    if (i == end && cb_empty(&this->client_buffers[this->id_table[i]])) {
         return NO_ORDER;
     }
-    return client;
+    return i;
 }
 
-void fill_message_event(TunnelServer* this, int id, int op) {
-    if (this->written_count != EVENT_MESSAGE_LENGTH) return;
+void ts_actual_remove(TunnelServer* this, int i) {
+    const int id = this->id_table[i];
 
-    this->written_count = 0;
-    this->event_message[0] = id;
-    this->event_message[1] = op;
+    remove_client(&this->server, id);
+
+    cb_free(&this->client_buffers[id]);
+    cb_free(&this->tunnel_buffers[id]);
+
+    this->id_table[i] = this->id_table[this->client_count - 1];
+    this->client_count--;
 }
 
-void fill_add_event(TunnelServer* this) {
-    if (this->written_count != EVENT_MESSAGE_LENGTH) return;
+bool process_empty_removed(TunnelServer* this) {
+    TPBuffer* tpb = &this->tunnel_tpb;
 
-    const int id = this->add_queue[this->event_start];
-    this->event_start = mod_inc(this->event_start, MAX_CLIENTS);
-
-    printf("actually adding: %d\n", id);
-
-    fill_message_event(this, id, CLIENT_ADD);
-}
-
-bool fill_remove_event(TunnelServer* this) {
-    if (this->written_count != EVENT_MESSAGE_LENGTH) return false;
-
-    for (size_t i = 0; i < this->client_count; ++i) {
+    for (size_t i = 0; i < this->client_count; ) {
         const int id = this->id_table[i];
-        if (!this->remove_flag[id]) continue;
-        if (!iob_empty(get_client_buf(&this->server, id))) continue;
+        
+        if (!this->remove_flag[id] ||
+            !cb_empty(&this->client_buffers[id])) {
+                ++i;
+                continue;
+            }
+
+        if (!cb_empty(&this->client_buffers[id])) continue;
+        if (!tpb_contol_message(tpb, CLIENT_REMOVE, id)) return false;
 
         this->remove_flag[id] = false;
-        remove_client(&this->server, id);
-        fill_message_event(this, id, CLIENT_REMOVE);
-
-        this->id_table[i] = this->id_table[this->client_count--];
-        printf("actually removing: %d\n", id);
-        return true;
+        ts_actual_remove(this, id);
     }
 
-    return false;
+    return true;
+}
+
+bool process_added(TunnelServer* this) {
+    TPBuffer* tpb = &this->tunnel_tpb;
+
+    for (char id; cb_peek(&this->add_queue, &id); cb_skip(&this->add_queue, 1)) {
+        if (!tpb_contol_message(tpb, CLIENT_ADD, id)) return false;
+    }
+
+    return true;
 }
 
 void fill_message(TunnelServer* this) {
-    MessageBuffer* mb = &this->server.tunnel_mb;
+    if (!process_empty_removed(this)) return;
+    if (!process_added(this)) return;
 
-    if (this->written_count != EVENT_MESSAGE_LENGTH) {
-        const ssize_t count = encapsulate(mb, 
-            &this->event_message[this->written_count], EVENT_MESSAGE_LENGTH - this->written_count, 
-            CONTROL_ORDER);
-
-        this->written_count += count;
-        if (this->written_count != EVENT_MESSAGE_LENGTH) return;
-    }
-
-    while (fill_remove_event(this)) {
-        const ssize_t count = encapsulate(mb, this->event_message, EVENT_MESSAGE_LENGTH, CONTROL_ORDER);
-
-        this->written_count += count;
-        if (this->written_count != EVENT_MESSAGE_LENGTH) return;
-    }
-
-    while (this->event_end != this->event_start) {
-        fill_add_event(this);
-        const ssize_t count = encapsulate(mb, this->event_message, EVENT_MESSAGE_LENGTH, CONTROL_ORDER);
-        
-        this->written_count += count;
-        if (this->written_count != EVENT_MESSAGE_LENGTH) return;
-    }
+    TPBuffer* tpb = &this->tunnel_tpb;
 
     do {
         if (this->send_order == NO_ORDER || this->send_count == 0) {
@@ -231,28 +193,29 @@ void fill_message(TunnelServer* this) {
             if (this->send_order == NO_ORDER) break;
         }
 
-        IOBuffer* data_buf = get_client_buf(&this->server, this->id_table[this->send_order]);
+        CyclicBuffer* data_buf = &this->client_buffers[this->id_table[this->send_order]];
         if (this->send_count == 0) {
             this->send_count = data_buf->count;
         }
 
         if (this->send_count == 0) break;
 
-        const ssize_t count = encapsulate(mb, data_buf->buf, this->send_count, this->id_table[this->send_order]);
+        cb_shift(data_buf);
+        const ssize_t count = tpb_encapsulate(tpb, cb_data(data_buf), this->send_count, this->id_table[this->send_order]);
         if (count >= 0) {
             this->send_count -= count;
-            iob_shift(data_buf, count);
         }
+        cb_skip(data_buf, count);
     } while (this->send_count == 0);
 }
 
-#define KB (1 << 10)
+/*#define KB (1 << 10)
 #define MB (KB << 10)
 
 #define MAX_BUF_SIZE (MB)
 
 void distribute_message(TunnelServer* this) {
-    MessageBuffer* mb = &this->server.tunnel_mb;
+    MessageReceiver* mb = &this->server.client_mb;
 
     int order;
     while ((order = get_current_order(mb)) != NO_ORDER) {
@@ -273,31 +236,45 @@ void distribute_message(TunnelServer* this) {
         IOBuffer* buffer = get_client_buf(&this->server, order);
         reserve(buffer, count);
 
-        decapsulate(mb, &buffer->buf[buffer->count], count);
-        buffer->count += count;
+        const size_t decapsulated = decapsulate(mb, &buffer->buf[buffer->count], count);
+        if (decapsulated < count) {
+            fprintf(stderr, 
+                "contiguous count and decapsulated count don't match!: (cont: %d, real: %d)\n",
+                count, decapsulated);
+        }
+        buffer->count += decapsulated;
 
         if (buffer->size >= MAX_BUF_SIZE) {
             ts_remove_client(this, order);
         }
     }
-}
+}*/
 
 void perform_protocol_io(TunnelServer* this) {
     Server* server = &this->server;
 
     fill_message(this);
-    IOBuffer* message = &server->tunnel_mb.message;
-
-    if (can_write(get_tunnel(server))) {
-        iob_send(message, get_tunnel(server)->fd);
+    if (tunnel_writeable(server)) {
+        tpb_send(&this->tunnel_tpb, tunnel_fd(server));
     }
 
-    distribute_message(this);
+    /*distribute_message(this);
     message = &server->client_mb.message;
 
     if (can_read(get_tunnel(server))) {
         iob_recv(message, get_tunnel(server)->fd);
+    }*/
+}
+
+void ts_cleanup(TunnelServer* this) {
+    cleanup_server(&this->server);
+
+    for (size_t i = 0; i < get_client_count(&this->server); ++i) {
+        cb_free(&this->client_buffers[this->id_table[i]]);
+        cb_free(&this->tunnel_buffers[this->id_table[i]]);
     }
+
+    tpb_free(&this->tunnel_tpb);
 }
 
 int main_loop(TunnelServer* this) {
@@ -324,10 +301,14 @@ int main_loop(TunnelServer* this) {
 
         perform_client_io(this, has_pending ? fd_count - 1 : fd_count);
         perform_protocol_io(this);
+
+        set_tunnel_writeable(server, !tpb_empty(&this->tunnel_tpb));
+        static const struct timespec sleep_time = {.tv_sec=0, .tv_nsec=10000000};
+        nanosleep(&sleep_time, NULL);
     }
 
     perror("poll");
-    cleanup_server(server);
+    ts_cleanup(this);
     return EXIT_FAILURE;
 }
 

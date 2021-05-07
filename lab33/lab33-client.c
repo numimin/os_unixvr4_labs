@@ -49,17 +49,23 @@ int main(int argc, char* argv[]) {
     }
 
     char line[64];
-    sprintf(line, "echo %d\n", index);
+    //char buf[BUFSIZ];
+    sprintf(line, "ec^ho? %d\n", index);
+    //sprintf(line, "GET /page%d HTTP/1.1\n\n", index);
     while (1) {
-        for (size_t i = 0; i < 1000; ++i) {
-            ssize_t count = write(sockfd, line, strlen(line));
-            if (count <= 0) {
-                perror("write");
-                break;
-            }
-            sleep(3);
+        ssize_t count = write(sockfd, line, strlen(line));
+        if (count <= 0) {
+            perror("write");
+            break;
         }
-        printf("write\n");
+        sleep(3);
+        
+        /*count = read(sockfd, buf, BUFSIZ);
+        if (count < 0) {
+            perror("read");
+            continue;
+        }
+        write(STDOUT_FILENO, buf, count);*/
     }
 
     close(sockfd);

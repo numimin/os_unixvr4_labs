@@ -3,12 +3,31 @@
 #include <stdlib.h>
 #include <string.h>
 
-#define BUFFER_SIZE 1024
-#define MESSAGE_SIZE (2 * BUFFER_SIZE + 3)
+#include "utils.h"
 
 #define POLL_LISTENER_INDEX 0
 #define POLL_TUNNEL_INDEX 1
 #define POLL_CLIENT_OFFSET 2
+
+bool is_pollable(const struct pollfd* pollfd, int mask) {
+    return pollfd->revents & mask;
+}
+
+bool can_read(const struct pollfd* pollfd) {
+    return is_pollable(pollfd, POLLIN);
+}
+
+bool can_write(const struct pollfd* pollfd) {
+    return is_pollable(pollfd, POLLOUT);
+}
+
+bool has_errors(const struct pollfd* pollfd) {
+    return is_pollable(pollfd, POLLERR);
+}
+
+bool is_ioable(const struct pollfd* pollfd) {
+    return is_pollable(pollfd, POLLIN | POLLOUT | POLLERR);
+}
 
 struct pollfd* get_client(Server* this, size_t id) {
     if (id >= MAX_CLIENTS || this->id_table[id] == REMOVED_CLIENT) return NULL;
@@ -16,12 +35,68 @@ struct pollfd* get_client(Server* this, size_t id) {
     return &this->clients[this->id_table[id] + POLL_CLIENT_OFFSET];
 }
 
+struct pollfd* get_tunnel(Server* this) {
+    return &this->clients[POLL_TUNNEL_INDEX];
+}
+
 struct pollfd* get_listener(Server* this) {
     return &this->clients[POLL_LISTENER_INDEX];
 }
 
-struct pollfd* get_tunnel(Server* this) {
-    return &this->clients[POLL_TUNNEL_INDEX];
+int client_fd(Server* this, size_t id) {
+    const struct pollfd* client = get_client(this, id);
+    if (client == NULL) return -1;
+    return client->fd;
+}
+
+bool client_pollable(Server* this, size_t id, int mask) {
+    const struct pollfd* client = get_client(this, id);
+    if (client == NULL) return false;
+    return is_pollable(client, mask);
+}
+
+bool client_ioable(Server* this, size_t id) {
+    return client_pollable(this, id, POLLIN | POLLOUT | POLLERR);
+}
+
+bool client_readable(Server* this, size_t id) {
+    return client_pollable(this, id, POLLIN);
+}
+
+bool client_writeable(Server* this, size_t id) {
+    return client_pollable(this, id, POLLOUT);
+}
+
+bool client_has_errors(Server* this, size_t id) {
+    return client_pollable(this, id, POLLERR);
+}
+
+int tunnel_fd(Server* this) {
+    const struct pollfd* tunnel = get_tunnel(this);
+    if (tunnel == NULL) return -1;
+    return tunnel->fd;
+}
+
+bool tunnel_pollable(Server* this, int mask) {
+    const struct pollfd* tunnel = get_tunnel(this);
+    if (tunnel == NULL) return false;
+    return is_pollable(tunnel, mask);
+}
+
+bool tunnel_ioable(Server* this) {
+    return tunnel_pollable(this, POLLIN | POLLOUT | POLLERR);
+}
+
+bool tunnel_readable(Server* this) {
+    return tunnel_pollable(this, POLLIN);
+}
+
+bool tunnel_writeable(Server* this) {
+    return tunnel_pollable(this, POLLOUT);
+}
+
+bool tunnel_has_errors(Server* this) {
+    return tunnel_pollable(this, POLLERR);
 }
 
 bool is_full(Server* this) {
@@ -56,8 +131,6 @@ int init_server(Server* this, const TunnelParams* params) {
     get_tunnel(this)->fd = tunnel_fd;
     get_tunnel(this)->events = POLLIN | POLLOUT;
 
-    init_mb(&this->tunnel_mb, MESSAGE_SIZE);
-    init_mb(&this->client_mb, MESSAGE_SIZE);
     return EXIT_SUCCESS;
 }
 
@@ -80,20 +153,7 @@ void safe_cleanup(Server* this) {
 
 void cleanup_server(Server* this) {
     safe_cleanup(this);
-
-    for (size_t i = 0; i < get_client_count(this); ++i) {
-        free_iobuf(&this->client_buffers[i]);
-        free_iobuf(&this->tunnel_buffers[i]);
-    }
-
-    free_messagebuf(&this->tunnel_mb);
-    free_messagebuf(&this->client_mb);
 }
-
-#define SWAP(T) void swap_##T (T* lhs, T* rhs) {T tmp = *lhs; *lhs = *rhs; *rhs = tmp;}
-
-SWAP(int)
-SWAP(short)
 
 void swap_poll(struct pollfd* lhs, struct pollfd* rhs) {
     swap_int(&lhs->fd, &rhs->fd);
@@ -113,9 +173,6 @@ void remove_client(Server* this, size_t id) {
     if (get_client(this, id) == NULL) return;
 
     disconnect_client(this, id);
-
-    free_iobuf(get_tunnel_buf(this, id));
-    free_iobuf(get_client_buf(this, id));
 
     this->client_count--;
     if (this->client_count != 0) {
@@ -145,19 +202,9 @@ int add_client(Server* this, int client_fd) {
     this->index_to_id[this->client_count] = id;
 
     get_client(this, id)->fd = client_fd;
-    init_iobuf(get_client_buf(this, id), BUFFER_SIZE);
-    init_iobuf(get_tunnel_buf(this, id), BUFFER_SIZE);
 
     this->client_count++;
     return id;
-}
-
-IOBuffer* get_tunnel_buf(Server* this, size_t id) {
-    return &this->tunnel_buffers[id];
-}
-
-IOBuffer* get_client_buf(Server* this, size_t id) {
-    return &this->client_buffers[id];
 }
 
 void set_pollable_on(struct pollfd* pollfd, int flags, bool pollable) {
